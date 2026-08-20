@@ -4,32 +4,27 @@ from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 import time
-import json
 
-# ===== 融合说明 =====
-# 原项目 main 分支死磕 creator.douyin.com 的「互动管理」（抖音已下架），
-# dev 分支改用 www.douyin.com/chat 但选择器已失效。
-# 这里把「进入聊天页 + 找会话 + 发消息」替换为目录项目 DkoBot 中
-# 已被实测稳定可用的选择器（翻译成 Playwright），其余配置系统原样保留。
+# ===== 融合说明（v2：创作者中心私信路径）=====
+# 原项目 main 分支死磕 creator.douyin.com 的「互动管理」（抖音已下架），导致超时卡死。
+# dev 分支改用 www.douyin.com/chat，但云机房 IP 一访问就被抖音弹「验证码中间页」(IP 风控)。
+# 现改为走 creator.douyin.com 的「私信管理」入口：
+#   1) 创作者中心目前无 IP 验证码，可绕开 www 的云机房风控；
+#   2) 私信管理入口在首页下滑后才显示，需滚动找到「私信管理」文本再点击；
+#   3) 进入后用【好友昵称直接定位会话】，不依赖抖音会变的哈希 class 名，更鲁棒。
 
 config = get_config()
 userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
-# DkoBot 的实测逻辑是按「会话列表显示的好友名」匹配，故 nickname 最稳。
+# 按「会话列表显示的好友名」匹配，故 nickname 最稳。
 # 若你填的是抖音号(short_id)，请改成 nickname 并在 targets 里填好友【原始昵称】。
 matchMode = config.get("matchMode", "nickname")
 
-# 稳定的 chat 入口（DkoBot 实测可用）
-CHAT_URL = "https://www.douyin.com/chat?isPopup=1"
-
-# 会话列表容器（用 contains 容忍抖音的哈希类名后缀，如 ...Listwrapper-3k2fA）
-LIST_WRAPPER = 'xpath=//div[contains(@class, "conversationConversationListwrapper")]'
-# 单个会话项
-CONV_ITEM = 'xpath=//div[contains(@class, "conversationConversationListwrapper")]/div/div/div'
-# 会话项内的好友名（DkoBot 验证过的路径）
-CONV_NAME = 'xpath=./div[1]/div[2]/div[1]/div[1]'
-# 消息输入框（DkoBot 验证过的路径）
-CHAT_INPUT = 'xpath=//div[contains(@class, "messageEditorimChatEditorContainer")]'
+# 私信列表直达 URL（用户验证：创作者中心首页下滑可见「互动管理」，其内「私信管理」
+# 按钮需异步加载；该 URL 可直接进入私信列表，绕开首页滚动 + 异步加载，优先尝试）
+IM_URL = "https://creator.douyin.com/creator-micro/data/following/chat"
+# 私信管理入口的链接/按钮文本（作为 IM_URL 直达失败、被弹回首页时的回退）
+IM_ENTRY_TEXT = "私信管理"
 
 
 def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
@@ -46,41 +41,19 @@ def retry_operation(name, operation, retries=3, delay=2, *args, **kwargs):
                 raise
 
 
-def get_conversations(page):
-    """读取当前可见的会话列表，返回 [(locator, 好友名), ...]"""
-    items = page.locator(CONV_ITEM).all()
-    convs = []
-    for item in items:
-        name = ""
-        try:
-            name = item.locator(CONV_NAME).inner_text().strip()
-        except Exception:
-            try:
-                # 兜底：直接取整项首行文本作为昵称
-                name = item.inner_text().strip().split("\n")[0]
-            except Exception:
-                name = ""
-        if name:
-            convs.append((item, name))
-    return convs
-
-
-def scroll_conversation_list(page):
-    """尝试滚动会话列表容器以加载更多（应对好友较多的情况）"""
+def _safe_title(page):
     try:
-        container = page.locator(LIST_WRAPPER).element_handle()
-        if not container:
-            return
-        for _ in range(4):
-            before = page.evaluate("(el) => el.scrollTop", container)
-            page.evaluate("(el) => el.scrollTop += 800", container)
-            time.sleep(0.5)
-            after = page.evaluate("(el) => el.scrollTop", container)
-            if before == after:
-                break
-        time.sleep(1)
-    except Exception:
-        pass
+        return page.title()
+    except Exception as e:
+        return f"(获取失败: {e})"
+
+
+def _safe_body(page, limit=500):
+    try:
+        return page.locator("body").inner_text(timeout=5000)[:limit]
+    except Exception as e:
+        logger.warning(f"读取页面 body 文本失败: {e}")
+        return ""
 
 
 def _snapshot(page, prefix="diag"):
@@ -103,9 +76,98 @@ def _snapshot(page, prefix="diag"):
         logger.error(f"保存 HTML 失败: {e}")
 
 
+def _detect_risk(page, username, label):
+    """快速风控识别：一旦出现验证码/登录墙，立刻结论退出（不再干等）"""
+    body_text = _safe_body(page)
+    title = _safe_title(page)
+    html_lower = ""
+    try:
+        html_lower = page.content().lower()
+    except Exception:
+        pass
+    if page.locator("text=验证").count() > 0 or "验证" in body_text or "验证码" in title or "captcha" in html_lower:
+        _snapshot(page, prefix="risk")
+        logger.error(
+            "【IP 风控】页面出现「验证码中间页」/ 人机验证。GitHub Actions 的云机房 IP "
+            "被抖音风控，无法自动通过。请改用：①住宅代理(PROXY_ADDRESS) ②本机/家庭服务器(住宅IP)运行。"
+        )
+        raise RuntimeError("IP 被抖音风控，终止任务")
+    if page.locator("text=登录").count() > 0 or "登录" in body_text:
+        _snapshot(page, prefix="no_login")
+        logger.error("页面仍在登录态，cookie 未生效。请确认从 www.douyin.com 登录后导出、且 session 未过期。")
+        raise RuntimeError("Cookie 未生效，终止任务")
+
+
+def _enter_im(page, username):
+    """回退路径：当 IM_URL 直达被弹回首页时使用。
+    在创作者中心首页滚动到「互动管理」板块，等「私信管理」入口异步加载并点击。"""
+    # 互动管理板块在首页一直存在，但里面的私信入口需要等异步请求回来才显示
+    logger.debug("等待「互动管理」板块渲染...")
+    try:
+        page.get_by_text("互动管理", exact=True).first.wait_for(timeout=config["browserTimeout"])
+    except Exception as e:
+        _snapshot(page, prefix="no_interact_section")
+        logger.error(f"未找到「互动管理」板块: {e}")
+        raise RuntimeError("未找到「互动管理」板块")
+
+    logger.debug("等待「私信管理」入口异步加载...")
+    for i in range(30):
+        try:
+            entry = page.get_by_text("私信管理", exact=False).first
+            if entry.count() > 0:
+                entry.click()
+                logger.debug("已点击「私信管理」")
+                # 等待私信管理页面加载
+                try:
+                    page.wait_for_load_state("networkidle", timeout=config["browserTimeout"])
+                except Exception:
+                    pass
+                time.sleep(2)
+                return
+        except Exception:
+            pass
+        # 入口可能还没加载出来，小步滚动并等待
+        page.mouse.wheel(0, 300)
+        time.sleep(1)
+
+    _snapshot(page, prefix="no_im_entry")
+    logger.error(
+        "互动管理板块内未等到「私信管理」入口。可能：①未登录 ②入口文本不是「私信管理」"
+        "③异步加载超时。请把 logs/no_im_entry.html 发我确认实际入口。"
+    )
+    raise RuntimeError("未找到「私信管理」入口")
+
+
+def _send_to(page, name, message):
+    """按昵称定位会话 -> 点击进入 -> 找输入框 -> 发送"""
+    conv = page.get_by_text(name, exact=False).first
+    conv.wait_for(timeout=config["browserTimeout"])
+    conv.click()
+    time.sleep(1.5)  # 等待右侧聊天框加载
+
+    # 找输入框：优先 textarea，其次 contenteditable 富文本
+    input_box = None
+    try:
+        input_box = page.locator("textarea").first
+        input_box.wait_for(timeout=config["browserTimeout"])
+    except Exception:
+        input_box = page.locator("[contenteditable='true']").first
+        input_box.wait_for(timeout=config["browserTimeout"])
+
+    input_box.click()
+    # 还原模板中的 \n 为换行：逐行输入，行间用 Shift+Enter
+    lines = message.split("\\n")
+    for idx, line in enumerate(lines):
+        input_box.press_sequentially(line)
+        if idx != len(lines) - 1:
+            input_box.press("Shift+Enter")
+    time.sleep(0.5)
+    page.keyboard.press("Enter")  # 发送
+
+
 def do_user_task(browser, username, cookies, targets):
-    """单账号任务：进 chat 页 -> 按昵称匹配会话 -> 发消息"""
-    # 视口设宽，避免 headless 下塌成手机版布局（DkoBot 桌面验证过）
+    """单账号任务：进创作者中心 -> 私信管理 -> 按昵称匹配会话 -> 发消息"""
+    # 视口设宽，避免 headless 下塌成手机版布局
     context = browser.new_context(viewport={"width": 1280, "height": 900})
     context.set_default_navigation_timeout(config["browserTimeout"])
     context.set_default_timeout(config["browserTimeout"])
@@ -113,92 +175,37 @@ def do_user_task(browser, username, cookies, targets):
     page = context.new_page()
 
     try:
-        # 先访问主页再注入 Cookie（与 DkoBot 一致：www.douyin.com 域）
-        retry_operation(
-            "打开抖音主页",
-            page.goto,
-            retries=config["taskRetryTimes"],
-            delay=5,
-            url="https://www.douyin.com/",
-            wait_until="domcontentloaded",
-        )
-        # 避免在页面继续导航时读 title() 触发 "Execution context was destroyed"
-        try:
-            home_title = page.title()
-        except Exception as e:
-            home_title = f"(获取失败: {e})"
-        logger.debug(f"主页加载后 URL={page.url} title={home_title}")
-
-        # 注入 Cookie（douyin.com 各子域通用）
+        # 关键：先注入 Cookie 再导航，且【跳过裸访问主页】
+        # 抖音对云机房 IP 会在裸主页弹「验证码中间页」(IP 风控)，直奔创作者中心带登录态可避免触发
         context.add_cookies(cookies)
+        cookie_names = [c.get("name") for c in cookies]
         logger.debug(f"已注入 {len(cookies)} 条 cookie")
+        # 仅打印关键鉴权 cookie 是否【存在】（不打印值，避免泄露），用于排查登录失效
+        for key in ("sessionid", "sid_tt", "ttwid", "odin_ticket", "sid_ucp_v1", "ssid_ucp_v1", "uid_tt"):
+            logger.debug(f"  鉴权 cookie {key}: {'存在' if key in cookie_names else '缺失'}")
 
-        # 进入 chat 页面（DkoBot 实测稳定入口）
+        # 直接进入私信列表（用户提供的直达 URL，绕开首页滚动 + 异步加载）
         retry_operation(
-            "导航到聊天页",
+            "导航到私信列表",
             page.goto,
             retries=config["taskRetryTimes"],
             delay=5,
-            url=CHAT_URL,
+            url=IM_URL,
             wait_until="domcontentloaded",
         )
-        try:
-            chat_title = page.title()
-        except Exception as e:
-            chat_title = f"(获取失败: {e})"
-        logger.debug(f"聊天页加载后 URL={page.url} title={chat_title}")
+        # 给列表一点异步加载时间
+        time.sleep(3)
+        logger.debug(f"私信列表 URL={page.url} title={_safe_title(page)}")
+        logger.debug(f"私信列表 body 前 500 字: {_safe_body(page)!r}")
 
-        # 如果 cookie 生效，这里应该会重定向/显示聊天列表；如果没生效，可能还在登录页
-        body_text = ""
-        try:
-            body_text = page.locator("body").inner_text(timeout=5000)[:500]
-        except Exception as e:
-            logger.warning(f"读取聊天页 body 文本失败: {e}")
-        logger.debug(f"聊天页 body 前 500 字: {body_text!r}")
+        # 风控识别（创作者中心若仍被云 IP 风控，会在此拦截）
+        _detect_risk(page, username, "私信列表页")
 
-        logger.debug(f"账号 {username} 等待会话列表加载")
-        try:
-            page.wait_for_selector(LIST_WRAPPER, timeout=config["browserTimeout"])
-        except Exception:
-            logger.error(f"账号 {username} 等待会话列表超时，准备诊断截图")
-            _snapshot(page, prefix="timeout")
-            # 再检查常见阻塞：登录按钮 / 验证码 / 空白页
-            if page.locator("text=登录").count() > 0 or "登录" in body_text:
-                logger.error("页面仍在登录态，cookie 未生效。请重新导出 www.douyin.com 的 Cookie 并更新 Secret。")
-            elif page.locator("text=验证").count() > 0 or "验证" in body_text or "captcha" in page.content().lower():
-                logger.error("页面出现人机验证/滑块，GitHub Actions IP 被风控。")
-            raise
-
-        time.sleep(config["friendListTimeout"] / 1000)
-
-        scroll_conversation_list(page)
-        convs = get_conversations(page)
-        logger.debug(f"账号 {username} 当前可见会话 {len(convs)} 个: {[n for _, n in convs]}")
-
+        message = build_message()
         matched = set()
-        for item, name in convs:
-            # 两种模式都按「会话显示名」匹配（DkoBot 实测逻辑）
-            if name not in targets:
-                continue
-            if name in matched:
-                continue
+        for name in targets:
             try:
-                item.click()
-                time.sleep(1.5)  # 等待右侧聊天框加载（DkoBot 实测等待时长）
-                # 等待输入框出现
-                page.wait_for_selector(CHAT_INPUT, timeout=config["browserTimeout"])
-                chat_input = page.locator(CHAT_INPUT)
-                chat_input.click()
-
-                message = build_message()
-                # 还原模板中的 \n 为换行：逐行输入，行间用 Shift+Enter
-                lines = message.split("\\n")
-                for idx, line in enumerate(lines):
-                    chat_input.press_sequentially(line)
-                    if idx != len(lines) - 1:
-                        chat_input.press("Shift+Enter")
-                time.sleep(0.5)
-                page.keyboard.press("Enter")  # 发送
+                _send_to(page, name, message)
                 matched.add(name)
                 logger.info(f"账号 {username} -> 已给好友「{name}」发送消息")
                 time.sleep(2)
@@ -210,8 +217,8 @@ def do_user_task(browser, username, cookies, targets):
         if not matched:
             _snapshot(page, prefix="no_match")
             logger.warning(
-                f"账号 {username} 未匹配到任何目标好友（共扫描 {len(convs)} 个会话）。"
-                f"请确认 MATCH_MODE 与 targets 是否为好友【原始昵称】，且这些好友在最近会话列表中。"
+                f"账号 {username} 未匹配到任何目标好友。请确认 MATCH_MODE 与 targets "
+                f"是否为好友【原始昵称】，且这些好友在私信管理的最近会话列表中。"
             )
         else:
             logger.info(f"账号 {username} 共向 {len(matched)} 位好友发送消息: {matched}")
