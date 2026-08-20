@@ -13,6 +13,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
+        repository: 2061360308/DouYinSparkFlow
         ref: dev
     - name: Set up Python
       uses: actions/setup-python@v4
