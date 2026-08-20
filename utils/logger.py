@@ -17,20 +17,19 @@ def setup_logger(name="app", level="Info"):
     """
     配置日志记录器
     :param name: 日志记录器名称
-    :param level: 日志级别
+    :param level: 日志级别（大小写不敏感：Debug/debug/DEBUG 均可）
     :return: 配置好的日志记录器
     """
-    if level == "Debug":
-        level = logging.DEBUG
-    elif level == "Info":
-        level = logging.INFO
-    elif level == "Warning":
-        level = logging.WARNING
-    elif level == "Error":
-        level = logging.ERROR
-    else:
-        level = logging.INFO
-    
+    # 大小写不敏感映射，避免 "Debug"/"debug"/"DEBUG" 因精确匹配失败而退回 INFO
+    level_map = {
+        "debug": logging.DEBUG,
+        "info": logging.INFO,
+        "warning": logging.WARNING,
+        "error": logging.ERROR,
+    }
+    if isinstance(level, str):
+        level = level_map.get(level.strip().lower(), logging.INFO)
+
     logger = logging.getLogger(name)
     logger.setLevel(level)
 
@@ -38,19 +37,21 @@ def setup_logger(name="app", level="Info"):
     if not logger.handlers:
         # 控制台日志处理器
         console_handler = logging.StreamHandler()
-        console_handler.setLevel(level)
         console_formatter = logging.Formatter(LOG_FORMAT)
         console_handler.setFormatter(console_formatter)
 
         # 文件日志处理器（带日志轮转）
         file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
-        file_handler.setLevel(level)
         file_formatter = logging.Formatter(LOG_FORMAT)
         file_handler.setFormatter(file_formatter)
 
         # 添加处理器到日志记录器
         logger.addHandler(console_handler)
         logger.addHandler(file_handler)
+
+    # 无论首次还是后续调用，都按最新 level 同步所有 handler，避免级别被首次调用锁定
+    for handler in logger.handlers:
+        handler.setLevel(level)
 
     return logger
 
