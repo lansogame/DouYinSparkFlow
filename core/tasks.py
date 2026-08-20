@@ -7,13 +7,14 @@ from core.msg_builder import build_message, build_message_with_openai
 from core.browser import get_browser
 import time
 
-# ===== 融合说明（v2：创作者中心私信路径）=====
+# ===== 融合说明（v3：创作者中心私信直达 + 逐会话重进 + 发送校验）=====
 # 原项目 main 分支死磕 creator.douyin.com 的「互动管理」（抖音已下架），导致超时卡死。
 # dev 分支改用 www.douyin.com/chat，但云机房 IP 一访问就被抖音弹「验证码中间页」(IP 风控)。
-# 现改为走 creator.douyin.com 的「私信管理」入口：
-#   1) 创作者中心目前无 IP 验证码，可绕开 www 的云机房风控；
-#   2) 私信管理入口在首页下滑后才显示，需滚动找到「私信管理」文本再点击；
-#   3) 进入后用【好友昵称直接定位会话】，不依赖抖音会变的哈希 class 名，更鲁棒。
+# v3 关键经验（实测踩坑）：
+#   1) 创作者中心无 IP 验证码，可绕开 www 的云机房风控，走私信直达 URL 最稳；
+#   2) 点开一个会话后，会话列表会被【隐藏】（单栏布局），必须每个会话重新进入列表再点；
+#   3) 输入框是 contenteditable div，页面存在多个，必须用探针实测「能打字」；
+#   4) 发送必须校验「输入框被清空 = 真正发出」，否则会假报成功（旧版就栽在这）。
 
 config = get_config()
 userData = get_userData()
@@ -235,49 +236,155 @@ def _send_to(page, target, message):
     _open_and_send(page, message, nickname)
 
 
-def _open_and_send(page, message, label):
-    """在当前已打开的聊天会话中：等输入框 -> 逐行输入 -> Enter + 兜底发送按钮"""
-    # 等待右侧聊天详情加载：先等一个可见的输入框出现
-    input_box = None
+def _find_editor(page, label):
+    """找到【真正能打字】的输入框（创作者中心私信输入框是 contenteditable div）。
+
+    页面里可能同时存在多个 contenteditable（搜索框、AI 输入框等），不能碰运气取 first，
+    必须用探针字符实测「输入能读回」才算数。候选按优先级：
+      1) contenteditable 且 class 含 editor
+      2) 最后一个 contenteditable（聊天输入框通常在 DOM 尾部）
+      3) textarea
+    """
+    # 先等聊天面板把输入框加载出来（最长 15s）
     try:
-        input_box = page.locator("textarea").filter(visible=True).first
-        input_box.wait_for(timeout=15000)
+        page.locator("[contenteditable='true']").first.wait_for(state="attached", timeout=15000)
     except Exception:
         try:
-            input_box = page.locator("[contenteditable='true']").filter(visible=True).first
-            input_box.wait_for(timeout=15000)
+            page.locator("textarea").first.wait_for(state="attached", timeout=5000)
+        except Exception:
+            pass
+
+    candidates = []
+    for sel in (
+        '[contenteditable="true"][class*="editor" i]',
+        '[contenteditable="true"]',
+        "textarea",
+    ):
+        try:
+            loc = page.locator(sel).filter(visible=True)
+            if loc.count() > 0:
+                candidates.append(loc.last)  # 聊天输入框通常位于 DOM 尾部
+        except Exception:
+            continue
+    if not candidates:
+        raise RuntimeError(f"「{label}」页面中未找到任何输入框")
+
+    for box in candidates:
+        try:
+            box.wait_for(state="attached", timeout=3000)
+            box.click()
+            time.sleep(0.3)
+            box.press_sequentially("_probe_")
+            time.sleep(0.3)
+            got = ""
+            try:
+                got = (box.inner_text() or "").strip()
+            except Exception:
+                pass
+            # 清空探针字符（JS selectAll + delete，对 contenteditable 最稳）
+            try:
+                box.evaluate(
+                    "el => { el.focus(); document.execCommand('selectAll'); "
+                    "document.execCommand('delete'); }"
+                )
+            except Exception:
+                pass
+            time.sleep(0.2)
+            if "_probe_" in got:
+                logger.debug(f"「{label}」输入框验证通过（实测可打字）")
+                return box
+            logger.debug(f"「{label}」候选输入框无法输入（读回为空），换下一个")
         except Exception as e:
-            raise RuntimeError(f"未找到聊天输入框: {e}")
+            logger.debug(f"「{label}」候选输入框不可用: {e}")
+            continue
+    raise RuntimeError(f"「{label}」未能找到可输入的输入框")
 
-    try:
-        tag = input_box.evaluate("el => el.tagName")
-    except Exception:
-        tag = "未知"
-    logger.debug(f"「{label}」已定位输入框，tag={tag}")
 
-    # 聚焦并逐行输入
+def _type_message(input_box, message):
+    """逐行输入消息；输入后读回校验，没打进去就用 JS insertText 兜底"""
     input_box.click()
-    time.sleep(0.3)
+    time.sleep(0.2)
     lines = message.split("\\n")
     for idx, line in enumerate(lines):
         if idx > 0:
             input_box.press("Shift+Enter")
             time.sleep(0.1)
-        input_box.press_sequentially(line)
-    time.sleep(0.5)
-
-    # 发送：先按 Enter，再兜底点「发送」按钮（防止 Enter 没触发）
-    input_box.press("Enter")
-    logger.debug(f"已按 Enter 发送给「{label}」")
-    time.sleep(0.8)
-
+        input_box.press_sequentially(line, delay=30)
+    time.sleep(0.4)
+    got = ""
     try:
-        send_btn = page.get_by_role("button", name="发送").filter(visible=True).first
-        if send_btn.count() > 0:
-            send_btn.click(force=True)
-            logger.debug(f"已兜底点击「发送」按钮给「{label}」")
+        got = (input_box.inner_text() or "").strip()
     except Exception:
         pass
+    first_line = lines[0].strip() if lines else ""
+    if first_line and first_line not in got:
+        # press_sequentially 没打进去 → JS 直接插入整段文本（contenteditable 最可靠）
+        logger.warning(f"按键输入未生效（读回={got[:40]!r}），改用 JS insertText 插入")
+        try:
+            input_box.evaluate(
+                "(el, t) => { el.focus(); document.execCommand('insertText', false, t); }",
+                message.replace("\\n", "\n"),
+            )
+            time.sleep(0.4)
+            got = (input_box.inner_text() or "").strip()
+        except Exception as e:
+            logger.error(f"JS insertText 也失败: {e}")
+    logger.debug(f"输入框最终内容: {got[:80]!r}")
+    return got
+
+
+def _send_message(page, input_box, label):
+    """发送消息并【校验真正发出】：输入框被清空 = 发出去了。
+
+    1) 先按 Enter（创作者中心 Enter 即发送）；
+    2) 若输入框未清空，再点「发送」按钮；
+    3) 最终仍没清空 → 返回 False（消息没发出去，别假报成功）。
+    """
+    input_box.press("Enter")
+    time.sleep(1.2)
+    remains = ""
+    try:
+        remains = (input_box.inner_text() or "").strip()
+    except Exception:
+        pass
+    if not remains:
+        logger.debug(f"「{label}」Enter 发送成功（输入框已清空）")
+        return True
+
+    logger.debug(f"「{label}」Enter 后输入框仍有内容，改为点击「发送」按钮")
+    clicked = False
+    try:
+        btn = page.get_by_role("button", name="发送").filter(visible=True).last
+        if btn.count() > 0 and btn.is_enabled():
+            btn.click(force=True)
+            clicked = True
+            time.sleep(1.2)
+    except Exception as e:
+        logger.debug(f"「{label}」点击发送按钮失败: {e}")
+    if clicked:
+        try:
+            remains = (input_box.inner_text() or "").strip()
+        except Exception:
+            remains = ""
+        if not remains:
+            logger.debug(f"「{label}」点击「发送」按钮后输入框已清空")
+            return True
+    logger.warning(f"「{label}」发送后输入框仍残留: {remains[:60]!r}")
+    return False
+
+
+def _open_and_send(page, message, label):
+    """在当前已打开的聊天会话中：找可输入框 -> 输入并校验 -> 发送并校验"""
+    input_box = _find_editor(page, label)
+    got = _type_message(input_box, message)
+    if not got.strip():
+        _snapshot(page, prefix=f"type_fail_{label}")
+        raise RuntimeError(f"「{label}」输入消息失败（输入框内容为空）")
+    ok = _send_message(page, input_box, label)
+    if not ok:
+        _snapshot(page, prefix=f"send_fail_{label}")
+        raise RuntimeError(f"「{label}」发送失败（输入框未被清空，消息未发出）")
+    logger.info(f"「{label}」消息已确认发送")
 
 
 def _send_top_n(page, n, message, username):
@@ -285,31 +392,46 @@ def _send_top_n(page, n, message, username):
 
     适用前提：用户已在抖音私信里把要续火花的好友全部置顶，且它们排在列表最前面。
     置顶项在 DOM 中自然排在最前，取前 n 个即可，规避花体昵称/符号/备注不可见等问题。
-    """
-    # 双保险：确保列表已渲染（白屏加载场景）
-    _wait_for_im_list(page)
-    time.sleep(1)
-    name_spans = page.locator('[class*="item-header-name"]')
-    total = name_spans.count()
-    logger.debug(f"私信列表共 {total} 个会话，准备按置顶顺序发前 {n} 个")
-    if total == 0:
-        raise RuntimeError("私信列表没有任何会话项，可能未登录或列表未加载")
-    if n > total:
-        logger.warning(f"目标数 {n} 大于实际会话数 {total}，将只发前 {total} 个")
-        n = total
 
+    关键：点开一个会话后，创作者中心会把会话列表【隐藏】（变成单栏聊天布局），
+    之前正是因此导致「点完第一个就找不到第二个」。所以每个会话都【重新进入私信列表】再点。
+    """
     sent = 0
     for i in range(n):
+        # 每个会话都重新进入私信列表，规避「点开会话后列表被隐藏」
+        retry_operation(
+            f"进入私信列表(第{i+1}轮)",
+            page.goto,
+            retries=config["taskRetryTimes"],
+            delay=5,
+            url=IM_URL,
+            wait_until="domcontentloaded",
+        )
+        _wait_for_im_list(page)
+        time.sleep(1)
+        name_spans = page.locator('[class*="item-header-name"]')
+        total = name_spans.count()
+        if total == 0:
+            _snapshot(page, prefix=f"empty_list_{i}")
+            raise RuntimeError("私信列表没有任何会话项，可能未登录或列表未加载")
+        if i >= total:
+            logger.warning(f"会话总数只有 {total} 个，目标第 {i+1} 个不存在，停止")
+            break
+
         span = name_spans.nth(i)
         try:
             nick = span.inner_text(timeout=3000)
         except Exception:
             nick = f"第{i+1}位"
         logger.debug(f"准备发第 {i+1}/{n} 个会话（昵称：{nick}）")
-        span.scroll_into_view_if_needed()
-        time.sleep(0.4)
-        span.click(force=True)
         try:
+            # 尽量滚动到可视区（失败也无妨，force 点击兜底）
+            try:
+                span.scroll_into_view_if_needed(timeout=3000)
+            except Exception:
+                pass
+            span.click(force=True)
+            time.sleep(0.5)
             _open_and_send(page, message, nick)
             logger.info(f"账号 {username} -> 已给第 {i+1} 位会话（{nick}）发送消息")
             sent += 1
@@ -317,7 +439,7 @@ def _send_top_n(page, n, message, username):
             logger.error(f"账号 {username} 第 {i+1} 位会话（{nick}）发送失败: {e}")
             _snapshot(page, prefix=f"send_fail_{nick}")
             traceback.print_exc()
-        time.sleep(2)
+        time.sleep(1.5)
     logger.info(f"账号 {username} 按置顶顺序共发送 {sent}/{n} 个会话")
 
 
@@ -368,11 +490,22 @@ def do_user_task(browser, username, cookies, targets):
             )
             _send_top_n(page, len(targets), message, username)
         else:
-            # 昵称匹配模式（默认）：按 targets 里的昵称定位会话
+            # 昵称匹配模式（默认）：按 targets 里的昵称定位会话。
+            # 注意：点开会话后列表会被隐藏，因此每个目标都重新进入私信列表再定位。
             matched = set()
             for target in targets:
                 nickname, _ = _parse_target(target)
                 try:
+                    retry_operation(
+                        "回到私信列表",
+                        page.goto,
+                        retries=config["taskRetryTimes"],
+                        delay=5,
+                        url=IM_URL,
+                        wait_until="domcontentloaded",
+                    )
+                    _wait_for_im_list(page)
+                    time.sleep(1)
                     _send_to(page, target, message)
                     matched.add(nickname)
                     logger.info(f"账号 {username} -> 已给好友「{nickname}」发送消息")
