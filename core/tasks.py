@@ -1,4 +1,6 @@
+import re
 import traceback
+import unicodedata
 from utils.logger import setup_logger
 from utils.config import get_config, get_userData
 from core.msg_builder import build_message, build_message_with_openai
@@ -16,8 +18,15 @@ import time
 config = get_config()
 userData = get_userData()
 logger = setup_logger(level=config.get("logLevel", "Info"))
-# 按「会话列表显示的好友名」匹配，故 nickname 最稳。
-# 若你填的是抖音号(short_id)，请改成 nickname 并在 targets 里填好友【原始昵称】。
+# 匹配模式（MATCH_MODE 环境变量）：
+#   nickname（默认）：按 targets 里的好友昵称定位会话；对花体/特殊 Unicode 会自动 NFKD 归一化。
+#   top / topN：不按文本匹配，直接按私信列表【置顶顺序】发前 N 个会话（N = targets 数量）。
+#               适用前提：要续火花的好友已全部置顶且排在最前。创作者中心不显示备注/抖音号，
+#               昵称又常有花体符号，此模式最省心、最稳。
+# targets 写法：
+#   字符串昵称：["粉芋球", "Serendipity🌟"]（nickname 模式）
+#   对象（推荐 nickname 模式）：[{"nickname": "粉芋球", "short_id": "xxx"}, ...]
+#   top 模式：targets 只需数量 = 目标数，内容随意（如 ["", "", ""] 或占位昵称）。
 matchMode = config.get("matchMode", "nickname")
 
 # 私信列表直达 URL（用户验证：创作者中心首页下滑可见「互动管理」，其内「私信管理」
@@ -138,31 +147,158 @@ def _enter_im(page, username):
     raise RuntimeError("未找到「私信管理」入口")
 
 
-def _send_to(page, name, message):
-    """按昵称定位会话 -> 点击进入 -> 找输入框 -> 发送"""
-    conv = page.get_by_text(name, exact=False).first
-    conv.wait_for(timeout=config["browserTimeout"])
-    conv.click()
-    time.sleep(1.5)  # 等待右侧聊天框加载
+def _normalize_name(name):
+    """把数学花体、手写体等特殊 Unicode 昵称归一化为普通 ASCII 文本，便于匹配"""
+    if not name:
+        return ""
+    # NFKD 拆分兼容字符（例如 𝒗𝒆𝒓𝒔𝒕𝒂𝒑𝒑𝒆𝒏 → verstappen）
+    return unicodedata.normalize("NFKD", name).strip()
 
-    # 找输入框：优先 textarea，其次 contenteditable 富文本
+
+def _parse_target(target):
+    """解析 target：支持字符串昵称或 {nickname, short_id} 对象"""
+    if isinstance(target, dict):
+        nickname = target.get("nickname", "")
+        short_id = target.get("short_id", "") or target.get("unique_id", "")
+        return str(nickname), str(short_id) if short_id else ""
+    return str(target), ""
+
+
+def _find_conversation(page, nickname):
+    """在私信列表中定位目标好友，优先匹配会话昵称 span，其次全局文本"""
+    candidates = [nickname, _normalize_name(nickname)]
+    seen = set()
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        # 优先：会话列表里的昵称 span（class 含 item-header-name）
+        # 用正则忽略大小写，避免特殊字符导致 Playwright text selector 异常
+        try:
+            loc = page.locator('[class*="item-header-name"]').filter(
+                has_text=re.compile(re.escape(name), re.IGNORECASE)
+            )
+            if loc.count() > 0:
+                logger.debug(f"通过会话昵称 span 匹配到「{nickname}」/「{name}」")
+                return loc.first
+        except Exception as e:
+            logger.debug(f"匹配昵称 span 失败: {e}")
+
+        # 兜底：全局文本（子串匹配）
+        try:
+            loc = page.get_by_text(name, exact=False)
+            if loc.count() > 0:
+                logger.debug(f"通过全局文本匹配到「{nickname}」/「{name}」")
+                return loc.first
+        except Exception as e:
+            logger.debug(f"全局文本匹配失败: {e}")
+
+    return None
+
+
+def _send_to(page, target, message):
+    """按昵称定位会话 -> 滚动点击 -> 确认进入聊天详情 -> 输入框发送 -> Enter + 兜底发送按钮"""
+    nickname, short_id = _parse_target(target)
+    if not nickname:
+        raise ValueError("target 缺少昵称")
+
+    logger.debug(f"开始给「{nickname}」发消息（short_id={short_id or '无'}）")
+
+    conv = _find_conversation(page, nickname)
+    if not conv:
+        raise RuntimeError(f"私信列表中未找到「{nickname}」（归一化后：{_normalize_name(nickname)}）")
+
+    # 元素可能在当前视口外或被标记 hidden，只要 DOM 存在即可，滚动后 force 点击
+    conv.wait_for(state="attached", timeout=config["browserTimeout"])
+    conv.scroll_into_view_if_needed()
+    time.sleep(0.5)
+    conv.click(force=True)
+    logger.debug(f"已点击会话「{nickname}」")
+    _open_and_send(page, message, nickname)
+
+
+def _open_and_send(page, message, label):
+    """在当前已打开的聊天会话中：等输入框 -> 逐行输入 -> Enter + 兜底发送按钮"""
+    # 等待右侧聊天详情加载：先等一个可见的输入框出现
     input_box = None
     try:
-        input_box = page.locator("textarea").first
-        input_box.wait_for(timeout=config["browserTimeout"])
+        input_box = page.locator("textarea").filter(visible=True).first
+        input_box.wait_for(timeout=15000)
     except Exception:
-        input_box = page.locator("[contenteditable='true']").first
-        input_box.wait_for(timeout=config["browserTimeout"])
+        try:
+            input_box = page.locator("[contenteditable='true']").filter(visible=True).first
+            input_box.wait_for(timeout=15000)
+        except Exception as e:
+            raise RuntimeError(f"未找到聊天输入框: {e}")
 
+    try:
+        tag = input_box.evaluate("el => el.tagName")
+    except Exception:
+        tag = "未知"
+    logger.debug(f"「{label}」已定位输入框，tag={tag}")
+
+    # 聚焦并逐行输入
     input_box.click()
-    # 还原模板中的 \n 为换行：逐行输入，行间用 Shift+Enter
+    time.sleep(0.3)
     lines = message.split("\\n")
     for idx, line in enumerate(lines):
-        input_box.press_sequentially(line)
-        if idx != len(lines) - 1:
+        if idx > 0:
             input_box.press("Shift+Enter")
+            time.sleep(0.1)
+        input_box.press_sequentially(line)
     time.sleep(0.5)
-    page.keyboard.press("Enter")  # 发送
+
+    # 发送：先按 Enter，再兜底点「发送」按钮（防止 Enter 没触发）
+    input_box.press("Enter")
+    logger.debug(f"已按 Enter 发送给「{label}」")
+    time.sleep(0.8)
+
+    try:
+        send_btn = page.get_by_role("button", name="发送").filter(visible=True).first
+        if send_btn.count() > 0:
+            send_btn.click(force=True)
+            logger.debug(f"已兜底点击「发送」按钮给「{label}」")
+    except Exception:
+        pass
+
+
+def _send_top_n(page, n, message, username):
+    """按私信列表【置顶顺序】发前 n 个会话，完全不依赖昵称/抖音号/备注。
+
+    适用前提：用户已在抖音私信里把要续火花的好友全部置顶，且它们排在列表最前面。
+    置顶项在 DOM 中自然排在最前，取前 n 个即可，规避花体昵称/符号/备注不可见等问题。
+    """
+    name_spans = page.locator('[class*="item-header-name"]')
+    total = name_spans.count()
+    logger.debug(f"私信列表共 {total} 个会话，准备按置顶顺序发前 {n} 个")
+    if total == 0:
+        raise RuntimeError("私信列表没有任何会话项，可能未登录或列表未加载")
+    if n > total:
+        logger.warning(f"目标数 {n} 大于实际会话数 {total}，将只发前 {total} 个")
+        n = total
+
+    sent = 0
+    for i in range(n):
+        span = name_spans.nth(i)
+        try:
+            nick = span.inner_text(timeout=3000)
+        except Exception:
+            nick = f"第{i+1}位"
+        logger.debug(f"准备发第 {i+1}/{n} 个会话（昵称：{nick}）")
+        span.scroll_into_view_if_needed()
+        time.sleep(0.4)
+        span.click(force=True)
+        try:
+            _open_and_send(page, message, nick)
+            logger.info(f"账号 {username} -> 已给第 {i+1} 位会话（{nick}）发送消息")
+            sent += 1
+        except Exception as e:
+            logger.error(f"账号 {username} 第 {i+1} 位会话（{nick}）发送失败: {e}")
+            _snapshot(page, prefix=f"send_fail_{nick}")
+            traceback.print_exc()
+        time.sleep(2)
+    logger.info(f"账号 {username} 按置顶顺序共发送 {sent}/{n} 个会话")
 
 
 def do_user_task(browser, username, cookies, targets):
@@ -202,26 +338,36 @@ def do_user_task(browser, username, cookies, targets):
         _detect_risk(page, username, "私信列表页")
 
         message = build_message()
-        matched = set()
-        for name in targets:
-            try:
-                _send_to(page, name, message)
-                matched.add(name)
-                logger.info(f"账号 {username} -> 已给好友「{name}」发送消息")
-                time.sleep(2)
-            except Exception as e:
-                logger.error(f"账号 {username} 给好友「{name}」发送失败: {e}")
-                _snapshot(page, prefix=f"send_fail_{name}")
-                traceback.print_exc()
-
-        if not matched:
-            _snapshot(page, prefix="no_match")
-            logger.warning(
-                f"账号 {username} 未匹配到任何目标好友。请确认 MATCH_MODE 与 targets "
-                f"是否为好友【原始昵称】，且这些好友在私信管理的最近会话列表中。"
+        if matchMode in ("top", "topN"):
+            # 置顶顺序模式：发前 len(targets) 个置顶会话，不依赖任何文本匹配
+            logger.info(
+                f"匹配模式=置顶顺序：按私信列表前 {len(targets)} 个置顶会话发送"
+                f"（请确保要续火花的好友已全部置顶且排在最前面，targets 数量 = 目标数）"
             )
+            _send_top_n(page, len(targets), message, username)
         else:
-            logger.info(f"账号 {username} 共向 {len(matched)} 位好友发送消息: {matched}")
+            # 昵称匹配模式（默认）：按 targets 里的昵称定位会话
+            matched = set()
+            for target in targets:
+                nickname, _ = _parse_target(target)
+                try:
+                    _send_to(page, target, message)
+                    matched.add(nickname)
+                    logger.info(f"账号 {username} -> 已给好友「{nickname}」发送消息")
+                    time.sleep(2)
+                except Exception as e:
+                    logger.error(f"账号 {username} 给好友「{nickname}」发送失败: {e}")
+                    _snapshot(page, prefix=f"send_fail_{nickname}")
+                    traceback.print_exc()
+
+            if not matched:
+                _snapshot(page, prefix="no_match")
+                logger.warning(
+                    f"账号 {username} 未匹配到任何目标好友。请确认 MATCH_MODE 与 targets "
+                    f"是否为好友【原始昵称】，且这些好友在私信管理的最近会话列表中。"
+                )
+            else:
+                logger.info(f"账号 {username} 共向 {len(matched)} 位好友发送消息: {matched}")
     finally:
         context.close()  # 任务完成后关闭上下文
 
