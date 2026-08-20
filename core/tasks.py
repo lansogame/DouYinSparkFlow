@@ -197,6 +197,23 @@ def _find_conversation(page, nickname):
     return None
 
 
+def _wait_for_im_list(page, timeout=90000):
+    """等待私信会话列表真正渲染（白屏加载后，昵称 span 才出现）。
+
+    注意：创作者中心私信页会白屏加载好一会，期间没有任何「加载中」文本，
+    不能用固定 sleep，必须等昵称 span 元素真正挂载到 DOM。
+    """
+    try:
+        page.locator('[class*="item-header-name"]').first.wait_for(
+            state="attached", timeout=timeout
+        )
+        logger.debug("私信会话列表已渲染（昵称 span 出现）")
+        return True
+    except Exception:
+        logger.warning("等待私信列表渲染超时，仍尝试继续")
+        return False
+
+
 def _send_to(page, target, message):
     """按昵称定位会话 -> 滚动点击 -> 确认进入聊天详情 -> 输入框发送 -> Enter + 兜底发送按钮"""
     nickname, short_id = _parse_target(target)
@@ -269,6 +286,9 @@ def _send_top_n(page, n, message, username):
     适用前提：用户已在抖音私信里把要续火花的好友全部置顶，且它们排在列表最前面。
     置顶项在 DOM 中自然排在最前，取前 n 个即可，规避花体昵称/符号/备注不可见等问题。
     """
+    # 双保险：确保列表已渲染（白屏加载场景）
+    _wait_for_im_list(page)
+    time.sleep(1)
     name_spans = page.locator('[class*="item-header-name"]')
     total = name_spans.count()
     logger.debug(f"私信列表共 {total} 个会话，准备按置顶顺序发前 {n} 个")
@@ -330,7 +350,9 @@ def do_user_task(browser, username, cookies, targets):
             wait_until="domcontentloaded",
         )
         # 给列表一点异步加载时间
-        time.sleep(3)
+        # 私信页会白屏加载好一会（无「加载中」文本），必须等会话列表真正渲染
+        _wait_for_im_list(page)
+        time.sleep(1.5)  # 等列表稳定
         logger.debug(f"私信列表 URL={page.url} title={_safe_title(page)}")
         logger.debug(f"私信列表 body 前 500 字: {_safe_body(page)!r}")
 
