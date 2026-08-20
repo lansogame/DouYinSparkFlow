@@ -165,6 +165,24 @@ def _parse_target(target):
     return str(target), ""
 
 
+def _conversation_item_from_span(span_loc):
+    """从昵称 span 上溯到真正可点击的列表项（semi-list-item-body 或 semi-list-item）。
+
+    UoUoio 优化版的经验：点击 span 有时不会触发列表项的点击事件，
+    应点击外层列表项 div。若找不到祖先，则退而点击 span 本身。
+    """
+    try:
+        item = span_loc.locator("xpath=ancestor::div[contains(@class, 'semi-list-item-body')]")
+        if item.count() > 0:
+            return item.first
+        item = span_loc.locator("xpath=ancestor::div[contains(@class, 'semi-list-item')]")
+        if item.count() > 0:
+            return item.first
+    except Exception:
+        pass
+    return span_loc
+
+
 def _find_conversation(page, nickname):
     """在私信列表中定位目标好友，优先匹配会话昵称 span，其次全局文本"""
     candidates = [nickname, _normalize_name(nickname)]
@@ -174,15 +192,14 @@ def _find_conversation(page, nickname):
             continue
         seen.add(name)
 
-        # 优先：会话列表里的昵称 span（class 含 item-header-name）
-        # 用正则忽略大小写，避免特殊字符导致 Playwright text selector 异常
+        # 优先：会话列表里的昵称 span（class 含 item-header-name，抖音实际 class 多为 item-header-name-xxxx）
         try:
             loc = page.locator('[class*="item-header-name"]').filter(
                 has_text=re.compile(re.escape(name), re.IGNORECASE)
             )
             if loc.count() > 0:
                 logger.debug(f"通过会话昵称 span 匹配到「{nickname}」/「{name}」")
-                return loc.first
+                return _conversation_item_from_span(loc.first)
         except Exception as e:
             logger.debug(f"匹配昵称 span 失败: {e}")
 
@@ -239,33 +256,45 @@ def _send_to(page, target, message):
 def _find_editor(page, label):
     """找到【真正能打字】的输入框（创作者中心私信输入框是 contenteditable div）。
 
-    页面里可能同时存在多个 contenteditable（搜索框、AI 输入框等），不能碰运气取 first，
-    必须用探针字符实测「输入能读回」才算数。候选按优先级：
-      1) contenteditable 且 class 含 editor
-      2) 最后一个 contenteditable（聊天输入框通常在 DOM 尾部）
-      3) textarea
+    参考 UoUoio 优化版：优先使用 class 前缀为 chat-input- 的 div（创作者中心私信输入框的
+    稳定 class 前缀），再用 contenteditable/textarea 兜底。所有候选都必须通过探针字符
+    实测「输入能读回」才算数，避免点到搜索框、AI 输入框等假输入框。
     """
-    # 先等聊天面板把输入框加载出来（最长 15s）
-    try:
-        page.locator("[contenteditable='true']").first.wait_for(state="attached", timeout=15000)
-    except Exception:
+    # 先等聊天面板把输入框加载出来（最长 15s）。优先等待 UoUoio 验证过的 chat-input-。
+    for sel in ("//div[contains(@class, 'chat-input-')]", "[contenteditable='true']", "textarea"):
         try:
-            page.locator("textarea").first.wait_for(state="attached", timeout=5000)
+            if sel.startswith("//"):
+                page.locator("xpath=" + sel).first.wait_for(state="attached", timeout=15000)
+            else:
+                page.locator(sel).first.wait_for(state="attached", timeout=15000)
+            break
         except Exception:
-            pass
+            continue
 
     candidates = []
-    for sel in (
-        '[contenteditable="true"][class*="editor" i]',
-        '[contenteditable="true"]',
-        "textarea",
-    ):
+    # 1) UoUoio 版最稳选择器：class 前缀 chat-input-
+    try:
+        loc = page.locator("xpath=//div[contains(@class, 'chat-input-')]")
+        if loc.count() > 0:
+            candidates.extend([loc.nth(i) for i in range(min(loc.count(), 3))])
+    except Exception:
+        pass
+    # 2) contenteditable 且 class 含 editor
+    try:
+        loc = page.locator('[contenteditable="true"][class*="editor" i]')
+        if loc.count() > 0:
+            candidates.append(loc.last)
+    except Exception:
+        pass
+    # 3) 兜底：contenteditable / textarea
+    for sel in ('[contenteditable="true"]', "textarea"):
         try:
-            loc = page.locator(sel).filter(visible=True)
+            loc = page.locator(sel)
             if loc.count() > 0:
                 candidates.append(loc.last)  # 聊天输入框通常位于 DOM 尾部
         except Exception:
             continue
+
     if not candidates:
         raise RuntimeError(f"「{label}」页面中未找到任何输入框")
 
@@ -301,9 +330,29 @@ def _find_editor(page, label):
 
 
 def _type_message(input_box, message):
-    """逐行输入消息；输入后读回校验，没打进去就用 JS insertText 兜底"""
+    """清空输入框后逐行输入消息；输入后读回校验，没打进去就用 JS insertText 兜底。
+
+    参考 UoUoio 优化版：发送前必须用 fill('') 或 JS selectAll+delete 清空旧内容，
+    避免上次残留的占位符/旧消息混进本次发送。
+    """
     input_box.click()
     time.sleep(0.2)
+
+    # 1) 清空输入框（UoUoio：chat_input.fill('')）
+    try:
+        input_box.fill("")
+    except Exception:
+        # contenteditable 不一定支持 fill，用 JS selectAll + delete 兜底
+        try:
+            input_box.evaluate(
+                "el => { el.focus(); document.execCommand('selectAll'); "
+                "document.execCommand('delete'); }"
+            )
+        except Exception:
+            pass
+    time.sleep(0.2)
+
+    # 2) 逐行输入
     lines = message.split("\\n")
     for idx, line in enumerate(lines):
         if idx > 0:
@@ -311,6 +360,8 @@ def _type_message(input_box, message):
             time.sleep(0.1)
         input_box.press_sequentially(line, delay=30)
     time.sleep(0.4)
+
+    # 3) 读回校验
     got = ""
     try:
         got = (input_box.inner_text() or "").strip()
@@ -334,14 +385,30 @@ def _type_message(input_box, message):
 
 
 def _send_message(page, input_box, label):
-    """发送消息并【校验真正发出】：输入框被清空 = 发出去了。
+    """发送消息并【校验真正发出】。
 
-    1) 先按 Enter（创作者中心 Enter 即发送）；
-    2) 若输入框未清空，再点「发送」按钮；
-    3) 最终仍没清空 → 返回 False（消息没发出去，别假报成功）。
+    参考 UoUoio 优化版的三重校验：
+      1) 发送后等待错误 toast（如「发送失败」「消息不能为空」）出现；
+      2) 输入框被清空（即消息已发出）；
+      3) 若 Enter 未触发，兜底点击「发送」按钮。
+    任一环节报异常或输入框未清空，都返回 False，拒绝假成功。
     """
+    error_toast_selector = '[class*="semi-toast-content"]'
+
     input_box.press("Enter")
     time.sleep(1.2)
+
+    # 1) 检查错误 toast
+    try:
+        for toast in page.locator(error_toast_selector).all():
+            toast_text = toast.inner_text().strip()
+            if toast_text:
+                logger.error(f"「{label}」发送后检测到错误提示：{toast_text}")
+                return False
+    except Exception:
+        pass
+
+    # 2) 检查输入框是否清空
     remains = ""
     try:
         remains = (input_box.inner_text() or "").strip()
@@ -351,6 +418,7 @@ def _send_message(page, input_box, label):
         logger.debug(f"「{label}」Enter 发送成功（输入框已清空）")
         return True
 
+    # 3) Enter 没触发，兜底点「发送」按钮
     logger.debug(f"「{label}」Enter 后输入框仍有内容，改为点击「发送」按钮")
     clicked = False
     try:
@@ -361,7 +429,17 @@ def _send_message(page, input_box, label):
             time.sleep(1.2)
     except Exception as e:
         logger.debug(f"「{label}」点击发送按钮失败: {e}")
+
     if clicked:
+        # 再次检查错误 toast
+        try:
+            for toast in page.locator(error_toast_selector).all():
+                toast_text = toast.inner_text().strip()
+                if toast_text:
+                    logger.error(f"「{label}」点击发送后检测到错误提示：{toast_text}")
+                    return False
+        except Exception:
+            pass
         try:
             remains = (input_box.inner_text() or "").strip()
         except Exception:
@@ -369,22 +447,35 @@ def _send_message(page, input_box, label):
         if not remains:
             logger.debug(f"「{label}」点击「发送」按钮后输入框已清空")
             return True
+
     logger.warning(f"「{label}」发送后输入框仍残留: {remains[:60]!r}")
     return False
 
 
 def _open_and_send(page, message, label):
-    """在当前已打开的聊天会话中：找可输入框 -> 输入并校验 -> 发送并校验"""
-    input_box = _find_editor(page, label)
-    got = _type_message(input_box, message)
-    if not got.strip():
-        _snapshot(page, prefix=f"type_fail_{label}")
-        raise RuntimeError(f"「{label}」输入消息失败（输入框内容为空）")
-    ok = _send_message(page, input_box, label)
-    if not ok:
-        _snapshot(page, prefix=f"send_fail_{label}")
-        raise RuntimeError(f"「{label}」发送失败（输入框未被清空，消息未发出）")
-    logger.info(f"「{label}」消息已确认发送")
+    """在当前已打开的聊天会话中：找可输入框 -> 输入并校验 -> 发送并校验。
+
+    参考 UoUoio 优化版：单条消息支持好友级重试（输入+发送整体重试），
+    因为页面偶尔会因网络抖动导致输入框未就绪或发送按钮未响应。
+    """
+    def _do_send():
+        input_box = _find_editor(page, label)
+        got = _type_message(input_box, message)
+        if not got.strip():
+            _snapshot(page, prefix=f"type_fail_{label}")
+            raise RuntimeError(f"「{label}」输入消息失败（输入框内容为空）")
+        ok = _send_message(page, input_box, label)
+        if not ok:
+            _snapshot(page, prefix=f"send_fail_{label}")
+            raise RuntimeError(f"「{label}」发送失败（输入框未被清空，消息未发出）")
+        logger.debug(f"「{label}」消息已确认发送")
+
+    retry_operation(
+        f"「{label}」发送消息",
+        _do_send,
+        retries=config["taskRetryTimes"],
+        delay=2,
+    )
 
 
 def _send_top_n(page, n, message, username):
@@ -425,13 +516,14 @@ def _send_top_n(page, n, message, username):
             nick = f"第{i+1}位"
         logger.debug(f"准备发第 {i+1}/{n} 个会话（昵称：{nick}）")
         try:
-            # 尽量滚动到可视区（失败也无妨，force 点击兜底）
+            # 点击外层列表项（而非 span），避免 span 不触发会话切换
+            item = _conversation_item_from_span(span)
             try:
-                span.scroll_into_view_if_needed(timeout=3000)
+                item.scroll_into_view_if_needed(timeout=3000)
             except Exception:
                 pass
-            span.click(force=True)
-            time.sleep(0.5)
+            item.click(force=True)
+            time.sleep(0.8)  # 等右侧聊天面板切换
             _open_and_send(page, message, nick)
             logger.info(f"账号 {username} -> 已给第 {i+1} 位会话（{nick}）发送消息")
             sent += 1
