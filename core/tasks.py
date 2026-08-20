@@ -83,6 +83,26 @@ def scroll_conversation_list(page):
         pass
 
 
+def _snapshot(page, prefix="diag"):
+    """保存截图和 HTML，方便排查页面实际状态"""
+    import os
+    os.makedirs("logs", exist_ok=True)
+    ts = int(time.time())
+    try:
+        ss_path = f"logs/{prefix}_{ts}.png"
+        page.screenshot(path=ss_path, full_page=True)
+        logger.info(f"已保存截图: {ss_path}")
+    except Exception as e:
+        logger.error(f"截图失败: {e}")
+    try:
+        html_path = f"logs/{prefix}_{ts}.html"
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        logger.info(f"已保存 HTML: {html_path}")
+    except Exception as e:
+        logger.error(f"保存 HTML 失败: {e}")
+
+
 def do_user_task(browser, username, cookies, targets):
     """单账号任务：进 chat 页 -> 按昵称匹配会话 -> 发消息"""
     # 视口设宽，避免 headless 下塌成手机版布局（DkoBot 桌面验证过）
@@ -92,75 +112,96 @@ def do_user_task(browser, username, cookies, targets):
 
     page = context.new_page()
 
-    # 先访问主页再注入 Cookie（与 DkoBot 一致：www.douyin.com 域）
-    retry_operation(
-        "打开抖音主页",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url="https://www.douyin.com/",
-    )
-    # 注入 Cookie（douyin.com 各子域通用）
-    context.add_cookies(cookies)
-
-    # 进入 chat 页面（DkoBot 实测稳定入口）
-    retry_operation(
-        "导航到聊天页",
-        page.goto,
-        retries=config["taskRetryTimes"],
-        delay=5,
-        url=CHAT_URL,
-    )
-
-    logger.debug(f"账号 {username} 等待会话列表加载")
-    page.wait_for_selector(LIST_WRAPPER, timeout=config["browserTimeout"])
-
-    time.sleep(config["friendListTimeout"] / 1000)
-
-    scroll_conversation_list(page)
-    convs = get_conversations(page)
-    logger.debug(f"账号 {username} 当前可见会话 {len(convs)} 个: {[n for _, n in convs]}")
-
-    matched = set()
-    for item, name in convs:
-        # 两种模式都按「会话显示名」匹配（DkoBot 实测逻辑）
-        if name not in targets:
-            continue
-        if name in matched:
-            continue
-        try:
-            item.click()
-            time.sleep(1.5)  # 等待右侧聊天框加载（DkoBot 实测等待时长）
-            # 等待输入框出现
-            page.wait_for_selector(CHAT_INPUT, timeout=config["browserTimeout"])
-            chat_input = page.locator(CHAT_INPUT)
-            chat_input.click()
-
-            message = build_message()
-            # 还原模板中的 \n 为换行：逐行输入，行间用 Shift+Enter
-            lines = message.split("\\n")
-            for idx, line in enumerate(lines):
-                chat_input.press_sequentially(line)
-                if idx != len(lines) - 1:
-                    chat_input.press("Shift+Enter")
-            time.sleep(0.5)
-            page.keyboard.press("Enter")  # 发送
-            matched.add(name)
-            logger.info(f"账号 {username} -> 已给好友「{name}」发送消息")
-            time.sleep(2)
-        except Exception as e:
-            logger.error(f"账号 {username} 给好友「{name}」发送失败: {e}")
-            traceback.print_exc()
-
-    if not matched:
-        logger.warning(
-            f"账号 {username} 未匹配到任何目标好友（共扫描 {len(convs)} 个会话）。"
-            f"请确认 MATCH_MODE 与 targets 是否为好友【原始昵称】，且这些好友在最近会话列表中。"
+    try:
+        # 先访问主页再注入 Cookie（与 DkoBot 一致：www.douyin.com 域）
+        retry_operation(
+            "打开抖音主页",
+            page.goto,
+            retries=config["taskRetryTimes"],
+            delay=5,
+            url="https://www.douyin.com/",
         )
-    else:
-        logger.info(f"账号 {username} 共向 {len(matched)} 位好友发送消息: {matched}")
+        logger.debug(f"主页加载后 URL={page.url} title={page.title()}")
 
-    context.close()  # 任务完成后关闭上下文
+        # 注入 Cookie（douyin.com 各子域通用）
+        context.add_cookies(cookies)
+        logger.debug(f"已注入 {len(cookies)} 条 cookie")
+
+        # 进入 chat 页面（DkoBot 实测稳定入口）
+        retry_operation(
+            "导航到聊天页",
+            page.goto,
+            retries=config["taskRetryTimes"],
+            delay=5,
+            url=CHAT_URL,
+        )
+        logger.debug(f"聊天页加载后 URL={page.url} title={page.title()}")
+
+        # 如果 cookie 生效，这里应该会重定向/显示聊天列表；如果没生效，可能还在登录页
+        body_text = page.locator("body").inner_text(timeout=5000)[:500]
+        logger.debug(f"聊天页 body 前 500 字: {body_text!r}")
+
+        logger.debug(f"账号 {username} 等待会话列表加载")
+        try:
+            page.wait_for_selector(LIST_WRAPPER, timeout=config["browserTimeout"])
+        except Exception:
+            logger.error(f"账号 {username} 等待会话列表超时，准备诊断截图")
+            _snapshot(page, prefix="timeout")
+            # 再检查常见阻塞：登录按钮 / 验证码 / 空白页
+            if page.locator("text=登录").count() > 0 or "登录" in body_text:
+                logger.error("页面仍在登录态，cookie 未生效。请重新导出 www.douyin.com 的 Cookie 并更新 Secret。")
+            elif page.locator("text=验证").count() > 0 or "验证" in body_text or "captcha" in page.content().lower():
+                logger.error("页面出现人机验证/滑块，GitHub Actions IP 被风控。")
+            raise
+
+        time.sleep(config["friendListTimeout"] / 1000)
+
+        scroll_conversation_list(page)
+        convs = get_conversations(page)
+        logger.debug(f"账号 {username} 当前可见会话 {len(convs)} 个: {[n for _, n in convs]}")
+
+        matched = set()
+        for item, name in convs:
+            # 两种模式都按「会话显示名」匹配（DkoBot 实测逻辑）
+            if name not in targets:
+                continue
+            if name in matched:
+                continue
+            try:
+                item.click()
+                time.sleep(1.5)  # 等待右侧聊天框加载（DkoBot 实测等待时长）
+                # 等待输入框出现
+                page.wait_for_selector(CHAT_INPUT, timeout=config["browserTimeout"])
+                chat_input = page.locator(CHAT_INPUT)
+                chat_input.click()
+
+                message = build_message()
+                # 还原模板中的 \n 为换行：逐行输入，行间用 Shift+Enter
+                lines = message.split("\\n")
+                for idx, line in enumerate(lines):
+                    chat_input.press_sequentially(line)
+                    if idx != len(lines) - 1:
+                        chat_input.press("Shift+Enter")
+                time.sleep(0.5)
+                page.keyboard.press("Enter")  # 发送
+                matched.add(name)
+                logger.info(f"账号 {username} -> 已给好友「{name}」发送消息")
+                time.sleep(2)
+            except Exception as e:
+                logger.error(f"账号 {username} 给好友「{name}」发送失败: {e}")
+                _snapshot(page, prefix=f"send_fail_{name}")
+                traceback.print_exc()
+
+        if not matched:
+            _snapshot(page, prefix="no_match")
+            logger.warning(
+                f"账号 {username} 未匹配到任何目标好友（共扫描 {len(convs)} 个会话）。"
+                f"请确认 MATCH_MODE 与 targets 是否为好友【原始昵称】，且这些好友在最近会话列表中。"
+            )
+        else:
+            logger.info(f"账号 {username} 共向 {len(matched)} 位好友发送消息: {matched}")
+    finally:
+        context.close()  # 任务完成后关闭上下文
 
 
 def runTasks():
