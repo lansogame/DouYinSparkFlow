@@ -120,8 +120,14 @@ def do_user_task(browser, username, cookies, targets):
             retries=config["taskRetryTimes"],
             delay=5,
             url="https://www.douyin.com/",
+            wait_until="domcontentloaded",
         )
-        logger.debug(f"主页加载后 URL={page.url} title={page.title()}")
+        # 避免在页面继续导航时读 title() 触发 "Execution context was destroyed"
+        try:
+            home_title = page.title()
+        except Exception as e:
+            home_title = f"(获取失败: {e})"
+        logger.debug(f"主页加载后 URL={page.url} title={home_title}")
 
         # 注入 Cookie（douyin.com 各子域通用）
         context.add_cookies(cookies)
@@ -134,11 +140,20 @@ def do_user_task(browser, username, cookies, targets):
             retries=config["taskRetryTimes"],
             delay=5,
             url=CHAT_URL,
+            wait_until="domcontentloaded",
         )
-        logger.debug(f"聊天页加载后 URL={page.url} title={page.title()}")
+        try:
+            chat_title = page.title()
+        except Exception as e:
+            chat_title = f"(获取失败: {e})"
+        logger.debug(f"聊天页加载后 URL={page.url} title={chat_title}")
 
         # 如果 cookie 生效，这里应该会重定向/显示聊天列表；如果没生效，可能还在登录页
-        body_text = page.locator("body").inner_text(timeout=5000)[:500]
+        body_text = ""
+        try:
+            body_text = page.locator("body").inner_text(timeout=5000)[:500]
+        except Exception as e:
+            logger.warning(f"读取聊天页 body 文本失败: {e}")
         logger.debug(f"聊天页 body 前 500 字: {body_text!r}")
 
         logger.debug(f"账号 {username} 等待会话列表加载")
@@ -219,8 +234,13 @@ def runTasks():
             targets = user["targets"]
             username = user.get("username", "未知用户")
             logger.info(f"开始处理账号 {username}")
-            do_user_task(browser, username, cookies, targets)
-            logger.info(f"账号 {username} 任务完成")
+            try:
+                do_user_task(browser, username, cookies, targets)
+                logger.info(f"账号 {username} 任务完成")
+            except Exception as e:
+                # 顶层兜底：任何未在 do_user_task 内部捕获的异常都记录到日志（含文件日志），避免静默崩溃
+                logger.error(f"账号 {username} 任务异常终止: {e}")
+                traceback.print_exc()
     finally:
         browser.close()
         playwright.stop()
